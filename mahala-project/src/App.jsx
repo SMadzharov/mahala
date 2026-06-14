@@ -551,24 +551,31 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
-  // ---- real auth: load session + profile from Supabase ----
+  // ---- real auth: track session synchronously (no awaits inside the callback!) ----
   useEffect(() => {
-    let active = true;
-    const loadProfile = async (su) => {
-      if (!su) { if (active) setUser(null); return; }
-      const { data } = await supabase.from("profiles").select("name,email,role").eq("id", su.id).single();
-      if (!active) return;
-      setUser({
+    const apply = (session) => {
+      const su = session?.user;
+      setUser(su ? {
         id: su.id,
-        name: data?.name || (su.email ? su.email.split("@")[0] : "Гост"),
-        email: data?.email || su.email,
-        role: data?.role || "customer",
-      });
+        name: su.user_metadata?.name || (su.email ? su.email.split("@")[0] : "Гост"),
+        email: su.email,
+        role: "customer",
+      } : null);
     };
-    supabase.auth.getSession().then(({ data }) => loadProfile(data.session?.user));
-    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => loadProfile(session?.user));
-    return () => { active = false; sub.subscription.unsubscribe(); };
+    supabase.auth.getSession().then(({ data }) => apply(data.session));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => apply(session));
+    return () => sub.subscription.unsubscribe();
   }, []);
+
+  // ---- load profile name + role once we know the user (runs outside the auth callback) ----
+  useEffect(() => {
+    if (!user?.id) return;
+    let active = true;
+    supabase.from("profiles").select("name,role").eq("id", user.id).single().then(({ data }) => {
+      if (active && data) setUser(u => (u && u.id === user.id) ? { ...u, name: data.name || u.name, role: data.role || "customer" } : u);
+    });
+    return () => { active = false; };
+  }, [user?.id]);
 
   const addBookingAdmin = async (rec) => {
     const { error } = await supabase.from("bookings").insert({
