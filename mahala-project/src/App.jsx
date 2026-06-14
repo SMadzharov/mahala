@@ -521,24 +521,23 @@ export default function App() {
   const [team, setTeam] = useState(false);
   const [voucher, setVoucher] = useState(false);
 
-  // seed some existing bookings so the calendar feels alive
-  const seed = useMemo(() => {
-    const base = new Date();
-    const mk = (offset, time, pkg, people, name, pay, email) => {
-      const d = new Date(base); d.setDate(d.getDate() + offset);
-      return { id: "MX" + Math.random().toString(36).slice(2, 7).toUpperCase(), date: ymd(d), time, pkg, people, name, pay, email: email || "" };
-    };
-    return [
-      mk(1, "18:00", "private", 60, "Делойт България", "paid", "events@deloitte.bg"),
-      mk(2, "20:00", "tournament", 24, "Отбор Панелка 4", "paid", "panelka4@email.bg"),
-      mk(3, "16:00", "birthday", 12, "Рожден ден – Иван", "onsite", "ivan@email.bg"),
-      mk(0, "20:00", "free", 18, "Група приятели", "paid", "banda@email.bg"),
-      mk(4, "12:00", "free", 8, "Семейство Колеви", "onsite", "kolevi@email.bg"),
-    ];
-  }, []);
-  const [bookings, setBookings] = useState(seed);
-  const [blocked, setBlocked] = useState([]); // admin-blocked dates
+  const [bookings, setBookings] = useState([]); // full rows (own/all per RLS)
+  const [avail, setAvail] = useState([]);        // public availability (date/time/people/pkg)
+  const [blocked, setBlocked] = useState([]);    // blocked dates
   const [pointAdjust, setPointAdjust] = useState({}); // email -> manual point delta
+
+  // ---- load everything from Supabase ----
+  const refresh = async () => {
+    const { data: av } = await supabase.from("availability").select("*");
+    if (av) setAvail(av.map(r => ({ date: r.booking_date, time: r.booking_time, people: r.people, pkg: r.pkg })));
+    const { data: bl } = await supabase.from("blocked_dates").select("d");
+    if (bl) setBlocked(bl.map(r => r.d));
+    const { data: bk2 } = await supabase.from("bookings").select("*").order("created_at", { ascending: false });
+    if (bk2) setBookings(bk2.map(r => ({ id: r.id, date: r.booking_date, time: r.booking_time, pkg: r.pkg, people: r.people, name: r.name, phone: r.phone, email: r.email, pay: r.pay, code: r.code })));
+    const { data: pr } = await supabase.from("profiles").select("email,points_adjust");
+    if (pr) { const m = {}; pr.forEach(p => { if (p.email) m[p.email] = p.points_adjust || 0; }); setPointAdjust(m); }
+  };
+  useEffect(() => { refresh(); }, [user?.email]);
 
   const showToast = (msg) => { setToast(msg); setTimeout(() => setToast(null), 2600); };
   const scroll = (id) => { setMenu(false); document.getElementById(id)?.scrollIntoView({ behavior: "smooth" }); };
@@ -560,6 +559,7 @@ export default function App() {
       const { data } = await supabase.from("profiles").select("name,email,role").eq("id", su.id).single();
       if (!active) return;
       setUser({
+        id: su.id,
         name: data?.name || (su.email ? su.email.split("@")[0] : "Гост"),
         email: data?.email || su.email,
         role: data?.role || "customer",
@@ -570,15 +570,39 @@ export default function App() {
     return () => { active = false; sub.subscription.unsubscribe(); };
   }, []);
 
-  const addBookingAdmin = (rec) => { setBookings(b => [rec, ...b]); showToast(lang === "bg" ? "Резервацията е добавена." : "Booking added."); };
-  const removeBooking = (id) => { setBookings(b => b.filter(x => x.id !== id)); showToast(lang === "bg" ? "Резервацията е премахната." : "Booking removed."); };
-  const adjustPoints = (email, delta) => { if (!email) return; setPointAdjust(m => ({ ...m, [email]: (m[email] || 0) + delta })); };
+  const addBookingAdmin = async (rec) => {
+    const { error } = await supabase.from("bookings").insert({
+      name: rec.name, phone: rec.phone, email: rec.email, pkg: rec.pkg,
+      booking_date: rec.date, booking_time: rec.time, people: rec.people, pay: rec.pay, code: rec.id,
+    });
+    if (error) { showToast(lang === "bg" ? "Грешка: " + error.message : "Error: " + error.message); return; }
+    await refresh();
+    showToast(lang === "bg" ? "Резервацията е добавена." : "Booking added.");
+  };
+  const removeBooking = async (id) => {
+    const { error } = await supabase.from("bookings").delete().eq("id", id);
+    if (error) { showToast(lang === "bg" ? "Грешка: " + error.message : "Error: " + error.message); return; }
+    await refresh();
+    showToast(lang === "bg" ? "Резервацията е премахната." : "Booking removed.");
+  };
+  const adjustPoints = async (email, delta) => {
+    if (!email) return;
+    const next = (pointAdjust[email] || 0) + delta;
+    const { error } = await supabase.from("profiles").update({ points_adjust: next }).eq("email", email);
+    if (error) { showToast(lang === "bg" ? "Грешка: " + error.message : "Error: " + error.message); return; }
+    setPointAdjust(m => ({ ...m, [email]: next }));
+  };
+  const toggleBlocked = async (d) => {
+    if (blocked.includes(d)) await supabase.from("blocked_dates").delete().eq("d", d);
+    else await supabase.from("blocked_dates").insert({ d });
+    await refresh();
+  };
 
   // ---- slot availability ----
   const slotInfo = (date, time) => {
     if (blocked.includes(date)) return { taken: CAP, blocked: true };
     let taken = 0, locked = false;
-    bookings.forEach(b => {
+    avail.forEach(b => {
       if (b.date === date && b.time === time) {
         if (["private", "tournament", "birthday"].includes(b.pkg)) locked = true;
         taken += b.people;
@@ -616,10 +640,16 @@ export default function App() {
     return p.price * b.people;
   };
 
-  const confirmBooking = () => {
+  const confirmBooking = async () => {
     const code = "MX" + Math.random().toString(36).slice(2, 7).toUpperCase();
-    const rec = { id: code, date: bk.date, time: bk.time, pkg: bk.pkg, people: bk.people, name: bk.name || "Гост", pay: bk.pay === "card" ? "paid" : "onsite", email: bk.email || user?.email || "" };
-    setBookings(b => [rec, ...b]);
+    const { error } = await supabase.from("bookings").insert({
+      user_id: user?.id || null,
+      name: bk.name || "Гост", phone: bk.phone || "", email: bk.email || user?.email || "",
+      pkg: bk.pkg, booking_date: bk.date, booking_time: bk.time, people: bk.people,
+      pay: bk.pay === "card" ? "paid" : "onsite", code,
+    });
+    if (error) { showToast(lang === "bg" ? "Грешка: " + error.message : "Error: " + error.message); return; }
+    await refresh();
     setBk({ ...bk, step: 4, code });
   };
 
@@ -985,7 +1015,7 @@ export default function App() {
         <AdminModal
           lang={lang} bookings={bookings} priceOf={priceOf} blocked={blocked} pointAdjust={pointAdjust}
           slotInfo={slotInfo} days={days}
-          onBlock={(d) => { setBlocked(b => b.includes(d) ? b.filter(x => x !== d) : [...b, d]); }}
+          onBlock={(d) => { toggleBlocked(d); }}
           onAdd={addBookingAdmin} onRemove={removeBooking} onAdjust={adjustPoints}
           onClose={() => setAdmin(false)}
         />
