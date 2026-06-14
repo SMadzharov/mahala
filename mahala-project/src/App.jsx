@@ -6,6 +6,7 @@ import {
   LogOut, Plus, Minus, ShieldCheck, Ticket, PartyPopper, Send, Globe,
   LayoutDashboard, Ban, Wallet, TrendingUp, LogIn, UserPlus, Trash2, Award
 } from "lucide-react";
+import { supabase } from "./supabase.js";
 
 /* ============================== STYLES ============================== */
 const CSS = `
@@ -83,6 +84,7 @@ const CSS = `
 .authnote{font-size:12px;color:var(--muted);font-weight:600;margin-top:16px;display:flex;gap:7px;align-items:flex-start;background:rgba(244,196,48,.16);border:1px solid rgba(244,196,48,.5);border-radius:11px;padding:10px 12px}
 .authalt{text-align:center;margin-top:16px;font-size:13.5px;font-weight:700;color:var(--muted)}
 .authalt b{color:var(--coral);cursor:pointer}
+.autherr{background:#fbeaea;border:1px solid #e6a8a3;color:#9c2b22;border-radius:11px;padding:10px 12px;font-size:13px;font-weight:700;margin-bottom:12px}
 .prof-pts{display:flex;gap:12px;margin:4px 0 18px}
 .prof-pts .pp{flex:1;background:#fff;border:2px solid rgba(20,42,44,.12);border-radius:14px;padding:14px;text-align:center}
 .prof-pts .pp b{font-family:var(--display);font-size:26px;display:block;color:var(--coral)}
@@ -491,6 +493,17 @@ const userPoints = (email, bookings, adjust = 0) => {
 const levelFor = (pts) => { let l = LEVELS[0]; for (const x of LEVELS) if (pts >= x.min) l = x; return l; };
 const nextLevelFor = (pts) => LEVELS.find(x => x.min > pts) || null;
 
+function translateErr(msg, lang) {
+  if (lang !== "bg") return msg || "Something went wrong.";
+  const m = (msg || "").toLowerCase();
+  if (m.includes("invalid login")) return "Грешен имейл или парола.";
+  if (m.includes("already registered") || m.includes("already exists")) return "Този имейл вече е регистриран.";
+  if (m.includes("at least 6") || m.includes("password")) return "Паролата трябва да е поне 6 символа.";
+  if (m.includes("email")) return "Невалиден имейл адрес.";
+  if (m.includes("rate")) return "Твърде много опити. Опитай след малко.";
+  return "Нещо се обърка. Опитай пак.";
+}
+
 /* ============================== APP ============================== */
 export default function App() {
   const [lang, setLang] = useState("bg");
@@ -539,6 +552,24 @@ export default function App() {
     return () => window.removeEventListener("keydown", onKey);
   }, []);
 
+  // ---- real auth: load session + profile from Supabase ----
+  useEffect(() => {
+    let active = true;
+    const loadProfile = async (su) => {
+      if (!su) { if (active) setUser(null); return; }
+      const { data } = await supabase.from("profiles").select("name,email,role").eq("id", su.id).single();
+      if (!active) return;
+      setUser({
+        name: data?.name || (su.email ? su.email.split("@")[0] : "Гост"),
+        email: data?.email || su.email,
+        role: data?.role || "customer",
+      });
+    };
+    supabase.auth.getSession().then(({ data }) => loadProfile(data.session?.user));
+    const { data: sub } = supabase.auth.onAuthStateChange((_e, session) => loadProfile(session?.user));
+    return () => { active = false; sub.subscription.unsubscribe(); };
+  }, []);
+
   const addBookingAdmin = (rec) => { setBookings(b => [rec, ...b]); showToast(lang === "bg" ? "Резервацията е добавена." : "Booking added."); };
   const removeBooking = (id) => { setBookings(b => b.filter(x => x.id !== id)); showToast(lang === "bg" ? "Резервацията е премахната." : "Booking removed."); };
   const adjustPoints = (email, delta) => { if (!email) return; setPointAdjust(m => ({ ...m, [email]: (m[email] || 0) + delta })); };
@@ -575,13 +606,7 @@ export default function App() {
     setBk({ step: 0, pkg: pkgId || null, date: null, time: null, people: 2, hours: 2, name: user?.name || "", phone: "", email: user?.email || "", pay: "card", code: null });
   };
 
-  const handleAuth = (u) => {
-    setUser(u);
-    setAuth(null);
-    showToast((lang === "bg" ? "Здравей, " : "Hi, ") + u.name + "!");
-    if (u.role === "owner") setAdmin(true);
-  };
-  const logout = () => { setUser(null); setProfile(false); setAdmin(false); showToast(lang === "bg" ? "Излезе от профила." : "Signed out."); };
+  const logout = async () => { await supabase.auth.signOut(); setUser(null); setProfile(false); setAdmin(false); showToast(lang === "bg" ? "Излезе от профила." : "Signed out."); };
   const openAdmin = () => { if (user?.role === "owner") setAdmin(true); else setAuth({ mode: "login", kind: "owner" }); };
 
   const priceOf = (b) => {
@@ -948,7 +973,7 @@ export default function App() {
       {voucher && <VoucherModal lang={lang} onClose={() => setVoucher(false)} />}
 
       {/* ---------- AUTH ---------- */}
-      {auth && <AuthModal auth={auth} setAuth={setAuth} lang={lang} onAuth={handleAuth} />}
+      {auth && <AuthModal auth={auth} setAuth={setAuth} lang={lang} onToast={showToast} />}
 
       {/* ---------- PROFILE ---------- */}
       {profile && user && (
@@ -992,15 +1017,36 @@ function GoogleG() {
   );
 }
 
-function AuthModal({ auth, setAuth, lang, onAuth }) {
+function AuthModal({ auth, setAuth, lang, onToast }) {
   const owner = auth.kind === "owner";
   const isReg = auth.mode === "register" && !owner;
   const [f, setF] = useState({ name: "", email: "", pass: "" });
+  const [busy, setBusy] = useState(false);
+  const [err, setErr] = useState("");
   const t = (bg, en) => (lang === "bg" ? bg : en);
-  const ok = f.email.includes("@") && f.pass.length >= 4 && (!isReg || f.name.trim().length > 1);
-  const submit = () => onAuth({ name: owner ? t("Собственик", "Owner") : (f.name || f.email.split("@")[0]), email: f.email, role: owner ? "owner" : "customer" });
-  const google = () => onAuth({ name: t("Google потребител", "Google user"), email: "google@mahala.bg", role: "customer" });
-  const setMode = (m) => setAuth({ ...auth, mode: m });
+  const ok = f.email.includes("@") && f.pass.length >= 6 && (!isReg || f.name.trim().length > 1);
+
+  const submit = async () => {
+    setErr(""); setBusy(true);
+    try {
+      if (isReg) {
+        const { data, error } = await supabase.auth.signUp({ email: f.email, password: f.pass, options: { data: { name: f.name } } });
+        if (error) throw error;
+        if (!data.session) { onToast(t("Готово! Провери имейла си за потвърждение.", "Done! Check your email to confirm.")); setAuth(null); return; }
+        onToast(t("Здравей, ", "Hi, ") + (f.name || f.email.split("@")[0]) + "!");
+      } else {
+        const { error } = await supabase.auth.signInWithPassword({ email: f.email, password: f.pass });
+        if (error) throw error;
+        onToast(t("Здравей пак!", "Welcome back!"));
+      }
+      setAuth(null);
+    } catch (e) {
+      setErr(translateErr(e?.message, lang));
+    } finally { setBusy(false); }
+  };
+  const google = () => onToast(t("Google входът се добавя на следваща стъпка.", "Google sign-in is coming next."));
+  const setMode = (m) => { setErr(""); setAuth({ ...auth, mode: m }); };
+
   return (
     <div className="overlay" onClick={() => setAuth(null)}>
       <div className="modal" onClick={e => e.stopPropagation()} style={{ maxWidth: 440 }}>
@@ -1025,18 +1071,19 @@ function AuthModal({ auth, setAuth, lang, onAuth }) {
               <div className="ordiv">{t("или с имейл", "or with email")}</div>
             </>
           )}
+          {err && <div className="autherr">{err}</div>}
           {isReg && (
             <div className="field"><label>{t("Име", "Name")}</label><input className="input" value={f.name} onChange={e => setF({ ...f, name: e.target.value })} placeholder={t("Твоето име", "Your name")} /></div>
           )}
           <div className="field"><label>{t("Имейл", "Email")}</label><input className="input" type="email" value={f.email} onChange={e => setF({ ...f, email: e.target.value })} placeholder={owner ? "owner@mahala.bg" : "ti@email.bg"} /></div>
-          <div className="field"><label>{t("Парола", "Password")}</label><input className="input" type="password" value={f.pass} onChange={e => setF({ ...f, pass: e.target.value })} placeholder="••••••" /></div>
-          <button className={"btn " + (owner ? "btn-ink" : "btn-coral")} style={{ width: "100%", justifyContent: "center" }} disabled={!ok} onClick={submit}>
-            {(!owner && auth.mode === "register") ? <><UserPlus size={17} />{t("Създай профил", "Create account")}</> : <><LogIn size={17} />{t("Влез", "Sign in")}</>}
+          <div className="field"><label>{t("Парола", "Password")}</label><input className="input" type="password" value={f.pass} onChange={e => setF({ ...f, pass: e.target.value })} placeholder={t("поне 6 символа", "at least 6 chars")} /></div>
+          <button className={"btn " + (owner ? "btn-ink" : "btn-coral")} style={{ width: "100%", justifyContent: "center" }} disabled={!ok || busy} onClick={submit}>
+            {busy ? t("Момент…", "One sec…") : (!owner && auth.mode === "register") ? <><UserPlus size={17} />{t("Създай профил", "Create account")}</> : <><LogIn size={17} />{t("Влез", "Sign in")}</>}
           </button>
-          <div className="authnote"><ShieldCheck size={14} /><span>{t("Демо режим — профилите още не са истински. Свързваме сигурен вход (Supabase) на следваща стъпка.", "Demo mode — accounts aren't real yet. We'll connect secure auth (Supabase) next.")}</span></div>
+          <div className="authnote"><ShieldCheck size={14} /><span>{t("Сигурен вход през Supabase — паролата ти е криптирана.", "Secure sign-in via Supabase — your password is encrypted.")}</span></div>
           <div className="authalt">
             {owner
-              ? <b onClick={() => setAuth({ mode: "login", kind: "customer" })}>{t("← Клиентски вход", "← Customer sign in")}</b>
+              ? <b onClick={() => { setErr(""); setAuth({ mode: "login", kind: "customer" }); }}>{t("← Клиентски вход", "← Customer sign in")}</b>
               : <>{t("Собственик или екип?", "Owner or staff?")} <b onClick={() => setAuth({ mode: "login", kind: "owner" })}>{t("Вход за екипа", "Team sign in")}</b></>}
           </div>
         </div>
